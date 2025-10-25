@@ -656,8 +656,10 @@ def extract_quotes(df: pd.DataFrame, limit: int = 2) -> List[str]:
     if df.empty:
         return []
 
-    content_series = df.get("content_text") or df.get("content")
-    if content_series is None:
+    content_series = df.get("content_text")
+    if content_series is None or content_series.dropna().empty:
+        content_series = df.get("content")
+    if content_series is None or content_series.dropna().empty:
         return []
 
     quotes = []
