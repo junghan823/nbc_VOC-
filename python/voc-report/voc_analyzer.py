@@ -7,6 +7,7 @@ confirm OAuth and column mappings before wiring the rest of the pipeline.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -32,6 +33,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_ENV_PATH = ROOT_DIR / ".env"
 DEFAULT_CREDENTIALS_PATH = ROOT_DIR / "credentials.json"
 DEFAULT_TOKEN_PATH = ROOT_DIR / "token.json"
+DEFAULT_REPORT_PATH = ROOT_DIR / "voc_report.json"
 
 
 def load_environment() -> None:
@@ -316,6 +318,160 @@ def extract_date_info(df: pd.DataFrame) -> Dict[str, object]:
     }
 
 
+def map_category_to_phase(category: Optional[str]) -> str:
+    """Maps a category string into a learning phase bucket."""
+    if not category:
+        return "기타"
+
+    category = category.strip().lower()
+    phase_rules = [
+        ("장비", "준비"),
+        ("기기", "준비"),
+        ("환경", "준비"),
+        ("수업", "진행"),
+        ("커리큘럼", "진행"),
+        ("멘토", "진행"),
+        ("지원", "지원"),
+        ("장려금", "행정"),
+        ("행정", "행정"),
+        ("출석", "행정"),
+    ]
+    for keyword, phase in phase_rules:
+        if keyword in category:
+            return phase
+    return "기타"
+
+
+def aggregate_phase_counts(df: pd.DataFrame) -> Dict[str, int]:
+    """Counts VOCs per learning phase."""
+    if df.empty:
+        return {}
+    phases = df.get("category", pd.Series(dtype=str)).apply(map_category_to_phase)
+    return phases.value_counts().to_dict()
+
+
+def extract_top_issues(df: pd.DataFrame, limit: int = 5) -> List[Dict[str, Any]]:
+    """Returns structured top issue list for presentation."""
+    top = top_categories(df, limit=limit)
+    issues = []
+    for rank, (category, count) in enumerate(top, start=1):
+        issues.append(
+            {
+                "rank": rank,
+                "category": category,
+                "count": int(count),
+            }
+        )
+    return issues
+
+
+def build_trend_cards(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Builds trend info combining month-over-month change with color cues."""
+    changes = month_over_month_change(df)
+    trends = []
+    for category, delta in changes.items():
+        if delta == float("inf"):
+            status = "increase"
+            emoji = "🔴"
+        elif delta >= 20:
+            status = "increase"
+            emoji = "🔴"
+        elif delta >= 5:
+            status = "moderate"
+            emoji = "🟡"
+        else:
+            status = "stable"
+            emoji = "🟢"
+        trends.append(
+            {
+                "category": category,
+                "change_pct": None if delta == float("inf") else round(delta, 1),
+                "status": status,
+                "emoji": emoji,
+            }
+        )
+    return trends
+
+
+def extract_quotes(df: pd.DataFrame, limit: int = 2) -> List[str]:
+    """Grabs representative learner quotes from content column."""
+    if "content" not in df or df.empty:
+        return []
+    quotes = []
+    for value in df["content"].dropna().head(limit):
+        text = str(value).strip().replace("\n", " ")
+        if len(text) > 180:
+            text = text[:177] + "..."
+        quotes.append(text)
+    return quotes
+
+
+def build_report(df: pd.DataFrame) -> Dict[str, Any]:
+    """Creates a structured JSON-ready report payload."""
+    now_kst = pd.Timestamp.now(tz="Asia/Seoul")
+    windows = compute_recent_windows_kst(df, reference=now_kst)
+    stats = summarise_stats(df)
+
+    recent_30 = windows["recent_30d"]
+    report = {
+        "meta": {
+            "generated_at": now_kst,
+            "analysis_period": {
+                "label": "최근 30일",
+                "start": stats.get("created_at_min"),
+                "end": stats.get("created_at_max"),
+            },
+            "total_count": stats["total_count"],
+        },
+        "windows": {
+            "recent_30d_count": stats["recent_30d_count"],
+            "prev_30d_count": stats["prev_30d_count"],
+            "recent_90d_count": stats["recent_90d_count"],
+        },
+        "issues": {
+            "top_recent_30d": extract_top_issues(recent_30, limit=5),
+            "phase_counts": aggregate_phase_counts(recent_30),
+            "trend_cards": build_trend_cards(df),
+        },
+        "samples": {
+            "recent_quotes": extract_quotes(recent_30, limit=2),
+        },
+        "recommendations": {
+            "short_term": [],
+            "mid_term": [],
+            "long_term": [],
+        },
+    }
+
+    # Serialize timestamps in trend cards if any numeric issues exist.
+    return convert_timestamps(report)
+
+
+def convert_timestamps(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively converts pandas/Datetime objects to ISO strings."""
+    def convert(value: Any) -> Any:
+        if isinstance(value, pd.Timestamp):
+            if pd.isna(value):
+                return None
+            return value.isoformat()
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, dict):
+            return {k: convert(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        return value
+
+    return convert(payload)
+
+
+def save_report(report: Dict[str, Any], path: Path) -> None:
+    """Writes the report payload to disk as JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    print(f"Report saved to {path}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Fetch VOC data from Google Sheets and run analyses."
@@ -329,6 +485,17 @@ def parse_args() -> argparse.Namespace:
         "--stats",
         action="store_true",
         help="Compute and print summary statistics after fetching data.",
+    )
+    parser.add_argument(
+        "--export-report",
+        action="store_true",
+        help="Generate JSON report file using the fetched data.",
+    )
+    parser.add_argument(
+        "--report-path",
+        type=str,
+        default=None,
+        help="Custom path for the generated report JSON file.",
     )
     parser.add_argument(
         "--limit",
@@ -346,20 +513,28 @@ def main() -> None:
     if args.fetch_only:
         print_sample_rows(limit=args.limit)
         return
-    if args.stats:
-        df = fetch_raw_data()
-        if df.empty:
-            print("No data available to compute statistics.")
-            return
-        stats = summarise_stats(df)
-        print(pd.Series(stats).to_markdown())
+    if not (args.stats or args.export_report):
+        print(
+            "No action requested. Use --fetch-only, --stats, or --export-report."
+        )
         return
 
-    # Placeholder for upcoming analysis pipeline.
-    print(
-        "Pipeline entry point not yet implemented. "
-        "Run with --fetch-only to test Google Sheets connectivity."
-    )
+    df = fetch_raw_data()
+    if df.empty:
+        print("No data available to process.")
+        return
+
+    if args.stats:
+        stats = summarise_stats(df)
+        print(pd.Series(stats).to_markdown())
+
+    if args.export_report:
+        report = build_report(df)
+        report_path = Path(
+            args.report_path
+            or os.environ.get("REPORT_OUTPUT_PATH", str(DEFAULT_REPORT_PATH))
+        )
+        save_report(report, report_path)
 
 
 if __name__ == "__main__":
