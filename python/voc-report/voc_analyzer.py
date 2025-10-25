@@ -350,19 +350,67 @@ def aggregate_phase_counts(df: pd.DataFrame) -> Dict[str, int]:
     return phases.value_counts().to_dict()
 
 
-def extract_top_issues(df: pd.DataFrame, limit: int = 5) -> List[Dict[str, Any]]:
-    """Returns structured top issue list for presentation."""
-    top = top_categories(df, limit=limit)
-    issues = []
-    for rank, (category, count) in enumerate(top, start=1):
-        issues.append(
+def compose_issue_keys(df: pd.DataFrame) -> pd.Series:
+    """Builds issue keys based on category/subcategory columns."""
+    if df.empty:
+        return pd.Series(dtype=str)
+
+    categories = df.get("category", pd.Series(index=df.index, dtype=str)).fillna("")
+    subcategories = df.get(
+        "subcategory", pd.Series(index=df.index, dtype=str)
+    ).fillna("")
+
+    categories = categories.astype(str).str.strip()
+    subcategories = subcategories.astype(str).str.strip()
+
+    issue_keys = categories.copy()
+    mask_sub = subcategories != ""
+    issue_keys.loc[mask_sub] = (
+        categories.loc[mask_sub] + " > " + subcategories.loc[mask_sub]
+    )
+
+    return issue_keys.where(issue_keys != "", "미분류")
+
+
+def compute_issue_counts(df: pd.DataFrame) -> Dict[str, int]:
+    """Counts occurrences per issue key."""
+    issue_keys = compose_issue_keys(df)
+    if issue_keys.empty:
+        return {}
+    counts = issue_keys.value_counts()
+    return counts.to_dict()
+
+
+def change_percentage(current: int, previous: int) -> float:
+    """Mimics Apps Script changePct calculation."""
+    if previous == 0 and current > 0:
+        return 100.0
+    if previous == 0 and current == 0:
+        return 0.0
+    return ((current - previous) / max(1, previous)) * 100.0
+
+
+def summarize_top_issues(
+    current_df: pd.DataFrame, previous_df: pd.DataFrame, limit: int = 5
+):
+    """Returns top issues with counts and change percentage, mirroring Apps Script."""
+    current_counts = compute_issue_counts(current_df)
+    previous_counts = compute_issue_counts(previous_df)
+
+    rows = []
+    for issue_key, count in current_counts.items():
+        previous = previous_counts.get(issue_key, 0)
+        rows.append(
             {
-                "rank": rank,
-                "category": category,
+                "issue_key": issue_key,
                 "count": int(count),
+                "previous_count": int(previous),
+                "change_pct": round(change_percentage(int(count), int(previous)), 1),
             }
         )
-    return issues
+
+    rows.sort(key=lambda item: item["count"], reverse=True)
+    return rows[:limit]
 
 
 def build_trend_cards(df: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -413,6 +461,20 @@ def build_report(df: pd.DataFrame) -> Dict[str, Any]:
     stats = summarise_stats(df)
 
     recent_30 = windows["recent_30d"]
+    prev_30 = windows["prev_30d"]
+    top_issues = summarize_top_issues(recent_30, prev_30, limit=5)
+    top_issue_rows = []
+    for rank, item in enumerate(top_issues, start=1):
+        top_issue_rows.append(
+            {
+                "rank": rank,
+                "issue_key": item["issue_key"],
+                "count": item["count"],
+                "previous_count": item["previous_count"],
+                "change_pct": item["change_pct"],
+            }
+        )
+
     report = {
         "meta": {
             "generated_at": now_kst,
@@ -429,7 +491,7 @@ def build_report(df: pd.DataFrame) -> Dict[str, Any]:
             "recent_90d_count": stats["recent_90d_count"],
         },
         "issues": {
-            "top_recent_30d": extract_top_issues(recent_30, limit=5),
+            "top_recent_30d": top_issue_rows,
             "phase_counts": aggregate_phase_counts(recent_30),
             "trend_cards": build_trend_cards(df),
         },
@@ -487,6 +549,11 @@ def parse_args() -> argparse.Namespace:
         help="Compute and print summary statistics after fetching data.",
     )
     parser.add_argument(
+        "--show-top-issues",
+        action="store_true",
+        help="Display top VOC issues with change percentages.",
+    )
+    parser.add_argument(
         "--export-report",
         action="store_true",
         help="Generate JSON report file using the fetched data.",
@@ -513,9 +580,9 @@ def main() -> None:
     if args.fetch_only:
         print_sample_rows(limit=args.limit)
         return
-    if not (args.stats or args.export_report):
+    if not (args.stats or args.export_report or args.show_top_issues):
         print(
-            "No action requested. Use --fetch-only, --stats, or --export-report."
+            "No action requested. Use --fetch-only, --stats, --show-top-issues, or --export-report."
         )
         return
 
@@ -527,6 +594,16 @@ def main() -> None:
     if args.stats:
         stats = summarise_stats(df)
         print(pd.Series(stats).to_markdown())
+
+    if args.show_top_issues:
+        windows = compute_recent_windows_kst(df)
+        recent_30 = windows["recent_30d"]
+        prev_30 = windows["prev_30d"]
+        top_rows = summarize_top_issues(recent_30, prev_30, limit=5)
+        if not top_rows:
+            print("No issues found in the recent 30-day window.")
+        else:
+            print(pd.DataFrame(top_rows).to_markdown(index=False))
 
     if args.export_report:
         report = build_report(df)
