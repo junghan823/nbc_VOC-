@@ -69,26 +69,62 @@ def render_top_issues(issues: List[Dict[str, Any]]) -> None:
                 help=f"직전 30일: {issue.get('previous_count', 0)}건",
             )
             st.markdown(f"{emoji} 변화 상태")
+            summary = issue.get("summary")
+            if summary:
+                st.caption(summary)
+            quotes = issue.get("quotes", [])
+            for quote in quotes:
+                st.markdown(f"- {quote}")
 
 
-def render_phase_analysis(phase_counts: Dict[str, Any]) -> None:
+def render_phase_analysis(
+    phase_counts: Dict[str, Any],
+    phase_breakdown: Dict[str, Any],
+) -> None:
     st.subheader("📚 학습 단계별 주요 불편")
-    if not phase_counts:
-        st.info("단계별 집계 데이터가 없습니다.")
+    if not phase_breakdown:
+        st.info("단계별 상세 데이터가 없습니다.")
         return
 
-    phase_df = pd.DataFrame(
-        [
-            {"단계": phase, "건수(30일)": count}
-            for phase, count in phase_counts.items()
-        ]
-    ).sort_values("건수(30일)", ascending=False)
+    if phase_counts:
+        summary_df = pd.DataFrame(
+            [
+                {"단계": phase, "건수(30일)": count}
+                for phase, count in phase_counts.items()
+            ]
+        ).sort_values("건수(30일)", ascending=False)
+        st.dataframe(summary_df, hide_index=True, use_container_width=True)
 
-    st.dataframe(
-        phase_df,
-        use_container_width=True,
-        hide_index=True,
-    )
+    phase_order = ["학습 준비", "학습 진행", "학습 지원", "행정 처리"]
+    for phase in phase_order:
+        detail = phase_breakdown.get(phase)
+        if not detail:
+            continue
+        total = detail.get("total", 0)
+        expander = st.expander(f"[{phase}] {total}건 (최근 30일)")
+        with expander:
+            issues = detail.get("issues", [])
+            if not issues:
+                st.write("세부 이슈가 없습니다.")
+            else:
+                data = []
+                for issue in issues:
+                    data.append(
+                        {
+                            "이슈": issue.get("issue_key"),
+                            "건수(30일)": issue.get("count"),
+                            "전월 30일": issue.get("previous_count"),
+                            "증감률": f"{issue.get('change_pct', 0):+.1f}%",
+                            "요약": issue.get("summary"),
+                        }
+                    )
+                st.dataframe(pd.DataFrame(data), hide_index=True, use_container_width=True)
+                for issue in issues:
+                    quotes = issue.get("quotes", [])
+                    if quotes:
+                        st.markdown(f"- **{issue.get('issue_key')}**")
+                        for quote in quotes:
+                            st.markdown(f"  - {quote}")
 
 
 def render_quotes(quotes: List[str]) -> None:
@@ -131,7 +167,11 @@ def main() -> None:
     st.divider()
     render_top_issues(report.get("issues", {}).get("top_recent_30d", []))
     st.divider()
-    render_phase_analysis(report.get("issues", {}).get("phase_counts", {}))
+    issues_section = report.get("issues", {})
+    render_phase_analysis(
+        issues_section.get("phase_counts", {}),
+        issues_section.get("phase_breakdown", {}),
+    )
     st.divider()
     render_quotes(report.get("samples", {}).get("recent_quotes", []))
     st.divider()

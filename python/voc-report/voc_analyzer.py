@@ -140,6 +140,76 @@ def standardise_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["created_at_raw"] = df["created_at"]
         df["created_at"] = df["created_at"].apply(parse_created_at)
 
+    df = assign_content_text(df)
+
+    return df
+
+
+def is_json_object(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        return False
+    try:
+        json.loads(text)
+        return True
+    except Exception:
+        return False
+
+
+def assign_content_text(df: pd.DataFrame) -> pd.DataFrame:
+    """Creates a content_text column prioritising sanitized inquiry text."""
+    if df.empty:
+        df["content_text"] = ""
+        return df
+
+    candidate_columns: List[str] = []
+    for col in df.columns:
+        name = str(col)
+        lower = name.lower()
+        if "문의" in name and "내용" in name:
+            candidate_columns.append(col)
+        elif lower in {"desc", "description"}:
+            candidate_columns.append(col)
+
+    candidate_columns = list(dict.fromkeys(candidate_columns))
+
+    content_series: List[str] = []
+    for idx, row in df.iterrows():
+        chosen: Optional[str] = None
+
+        for col in candidate_columns:
+            value = row.get(col)
+            if value is None or pd.isna(value):
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            if is_json_object(text):
+                continue
+            chosen = text
+            break
+
+        if chosen is None:
+            raw = row.get("content")
+            if isinstance(raw, str) and is_json_object(raw):
+                try:
+                    parsed = json.loads(raw)
+                    desc = parsed.get("desc") or parsed.get("description")
+                    if desc:
+                        chosen = str(desc).strip()
+                except Exception:
+                    chosen = None
+
+        if chosen is None:
+            fallback = row.get("content")
+            if fallback is not None and not pd.isna(fallback):
+                chosen = str(fallback).strip()
+
+        content_series.append(chosen or "")
+
+    df["content_text"] = pd.Series(content_series, index=df.index)
     return df
 
 
@@ -391,26 +461,166 @@ def change_percentage(current: int, previous: int) -> float:
 
 
 def summarize_top_issues(
-    current_df: pd.DataFrame, previous_df: pd.DataFrame, limit: int = 5
-):
+    current_df: pd.DataFrame,
+    previous_df: pd.DataFrame,
+    limit: int = 5,
+    quotes_per_issue: int = 2,
+) -> List[Dict[str, Any]]:
     """Returns top issues with counts and change percentage, mirroring Apps Script."""
     current_counts = compute_issue_counts(current_df)
     previous_counts = compute_issue_counts(previous_df)
 
+    issue_quotes: Dict[str, List[str]] = {}
+    if not current_df.empty:
+        issue_keys = compose_issue_keys(current_df)
+        content_series = current_df.get(
+            "content_text", pd.Series(index=current_df.index, dtype=str)
+        )
+        for idx, issue_key in issue_keys.items():
+            if not isinstance(issue_key, str):
+                continue
+            text_value = ""
+            if content_series is not None and idx in content_series.index:
+                text_value = str(content_series.loc[idx])
+            if not text_value and "content" in current_df.columns:
+                text_value = str(current_df.loc[idx].get("content", "") or "")
+            text_value = text_value.strip().replace("\n", " ")
+            if not text_value:
+                continue
+            if issue_key not in issue_quotes:
+                issue_quotes[issue_key] = []
+            if len(issue_quotes[issue_key]) >= quotes_per_issue:
+                continue
+            if len(text_value) > 120:
+                text_value = text_value[:117] + "..."
+            issue_quotes[issue_key].append(f'예: "{text_value}"')
+
     rows = []
     for issue_key, count in current_counts.items():
         previous = previous_counts.get(issue_key, 0)
+        change = round(change_percentage(int(count), int(previous)), 1)
         rows.append(
             {
                 "issue_key": issue_key,
                 "count": int(count),
                 "previous_count": int(previous),
-                "change_pct": round(change_percentage(int(count), int(previous)), 1),
+                "change_pct": change,
+                "summary": build_issue_summary(issue_key, change),
+                "quotes": issue_quotes.get(issue_key, []),
             }
         )
 
     rows.sort(key=lambda item: item["count"], reverse=True)
     return rows[:limit]
+
+
+def build_issue_summary(issue_key: str, change_pct: float) -> str:
+    """Generates a one-line summary similar to Apps Script."""
+    sign = "+" if change_pct >= 0 else ""
+    rounded = int(round(change_pct))
+    return f"{issue_key} 전월 대비 {sign}{rounded}%"
+
+
+def determine_phase_from_row(row: pd.Series) -> str:
+    """Assigns a phase using category, subcategory, and content heuristics."""
+    text = " ".join(
+        str(row.get(col, "") or "")
+        for col in ("category", "subcategory", "content_text", "content")
+    ).lower()
+
+    patterns = [
+        (r"(장비|노트북|맥북|사양|대여|반납|주변기기|모니터|마우스|키보드)", "학습 준비"),
+        (r"(플랫폼|실습|콘솔|빌드|로그인|접속|출결|qr|오류|강의실)", "학습 진행"),
+        (r"(장려금|지원금|지급|자격|증빙|정산)", "학습 지원"),
+        (r"(수강 변경|휴가|공가|행정|신청|증명서|환불|이관|출석)", "행정 처리"),
+    ]
+
+    for pattern, phase in patterns:
+        if re.search(pattern, text):
+            return phase
+
+    return "학습 진행"
+
+
+def aggregate_phase_breakdown(
+    current_df: pd.DataFrame,
+    previous_df: pd.DataFrame,
+    quotes_per_issue: int = 2,
+    top_per_phase: int = 6,
+) -> Dict[str, Dict[str, Any]]:
+    """Builds phase-specific breakdown similar to Apps Script."""
+    if current_df.empty:
+        return {}
+
+    current_phase = current_df.apply(determine_phase_from_row, axis=1)
+    prev_phase = (
+        previous_df.apply(determine_phase_from_row, axis=1)
+        if not previous_df.empty
+        else pd.Series(index=previous_df.index, dtype=str)
+    )
+
+    current_issues = compose_issue_keys(current_df)
+    prev_issues = compose_issue_keys(previous_df) if not previous_df.empty else None
+    current_texts = current_df.get(
+        "content_text", pd.Series(index=current_df.index, dtype=str)
+    )
+
+    phase_data: Dict[str, Dict[str, Any]] = {}
+
+    for idx, phase in current_phase.items():
+        issue_key = current_issues.get(idx, "미분류")
+        phase_bucket = phase_data.setdefault(
+            phase,
+            {"total": 0, "issues": {}, "quotes": {}},
+        )
+        phase_bucket["total"] += 1
+        phase_bucket["issues"][issue_key] = phase_bucket["issues"].get(issue_key, 0) + 1
+
+        if issue_key not in phase_bucket["quotes"]:
+            phase_bucket["quotes"][issue_key] = []
+        if len(phase_bucket["quotes"][issue_key]) < quotes_per_issue:
+            text_val = ""
+            if current_texts is not None and idx in current_texts.index:
+                text_val = str(current_texts.loc[idx] or "")
+            if not text_val:
+                text_val = str(current_df.loc[idx].get("content", "") or "")
+            text_val = text_val.strip().replace("\n", " ")
+            if text_val:
+                if len(text_val) > 120:
+                    text_val = text_val[:117] + "..."
+                phase_bucket["quotes"][issue_key].append(f'예: "{text_val}"')
+
+    prev_counts: Dict[str, Dict[str, int]] = {}
+    if prev_issues is not None:
+        for idx, phase in prev_phase.items():
+            issue_key = prev_issues.get(idx, "미분류")
+            prev_phase_bucket = prev_counts.setdefault(phase, {})
+            prev_phase_bucket[issue_key] = prev_phase_bucket.get(issue_key, 0) + 1
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for phase, info in phase_data.items():
+        issues_list = []
+        for issue_key, count in info["issues"].items():
+            previous = prev_counts.get(phase, {}).get(issue_key, 0)
+            change = round(change_percentage(count, previous), 1)
+            issues_list.append(
+                {
+                    "issue_key": issue_key,
+                    "count": count,
+                    "previous_count": previous,
+                    "change_pct": change,
+                    "summary": build_issue_summary(issue_key, change),
+                    "quotes": info["quotes"].get(issue_key, []),
+                }
+            )
+
+        issues_list.sort(key=lambda item: item["count"], reverse=True)
+        result[phase] = {
+            "total": info["total"],
+            "issues": issues_list[:top_per_phase],
+        }
+
+    return result
 
 
 def build_trend_cards(df: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -443,10 +653,15 @@ def build_trend_cards(df: pd.DataFrame) -> List[Dict[str, Any]]:
 
 def extract_quotes(df: pd.DataFrame, limit: int = 2) -> List[str]:
     """Grabs representative learner quotes from content column."""
-    if "content" not in df or df.empty:
+    if df.empty:
         return []
+
+    content_series = df.get("content_text") or df.get("content")
+    if content_series is None:
+        return []
+
     quotes = []
-    for value in df["content"].dropna().head(limit):
+    for value in content_series.dropna().head(limit):
         text = str(value).strip().replace("\n", " ")
         if len(text) > 180:
             text = text[:177] + "..."
@@ -472,6 +687,8 @@ def build_report(df: pd.DataFrame) -> Dict[str, Any]:
                 "count": item["count"],
                 "previous_count": item["previous_count"],
                 "change_pct": item["change_pct"],
+                "summary": item.get("summary"),
+                "quotes": item.get("quotes", []),
             }
         )
 
@@ -493,6 +710,7 @@ def build_report(df: pd.DataFrame) -> Dict[str, Any]:
         "issues": {
             "top_recent_30d": top_issue_rows,
             "phase_counts": aggregate_phase_counts(recent_30),
+            "phase_breakdown": aggregate_phase_breakdown(recent_30, prev_30),
             "trend_cards": build_trend_cards(df),
         },
         "samples": {
